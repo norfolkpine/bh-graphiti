@@ -1,112 +1,109 @@
-# Custom Temporal Context Graph Implementation
+# Production-Ready Custom Temporal Context Graph
 
-This document outlines the architecture and core functionality required to build a custom, minimal version of Graphiti, specifically optimized for **Pydantic AI Agents** using **PostgreSQL** for session management and **FalkorDB** for graph knowledge.
+This guide outlines how to build a production-grade temporal context graph system for AI agents using **PostgreSQL**, **FalkorDB**, and **Pydantic**. This architecture is inspired by Graphiti but simplified for direct integration into custom agent stacks.
 
-## 1. Architecture Overview
+## 1. Production Architecture
 
-A high-functionality context graph system consists of three primary layers:
+A production-ready system must handle high concurrency, provide observability, and be resilient to failures in external services (LLMs/Databases).
 
-1.  **Persistence Layer (Postgres):** Stores raw episodes (chat messages), session metadata, and user/agent state. This is the source of truth for "what was said."
-2.  **Knowledge Layer (FalkorDB):** Stores the "distilled" graph of entities and relationships. Each fact in this layer is bi-temporal (`valid_at`, `invalid_at`) and links back to its source episode in Postgres.
-3.  **Intelligence Layer (Pydantic + LLM):** Handles extraction of entities/relationships from episodes and resolution of duplicates.
+### Core Components
+1.  **Postgres (Source of Truth):** Stores raw `Sessions` and `Episodes`.
+2.  **FalkorDB (Knowledge Layer):** Stores the temporal graph of `Entities` and `Relationships`.
+3.  **Knowledge Manager (Logic):** Coordinates extraction, deduplication, and temporal invalidation.
+4.  **Embedder & LLM Clients:** Wrappers with built-in retries and tracing.
 
-## 2. Data Models (Pydantic)
+## 2. Production Data Models (Pydantic)
 
-The interface between your agent and the graph should be strictly typed.
+Use strict typing and validation.
 
 ```python
 from datetime import datetime
-from typing import Optional, Any
-from pydantic import BaseModel, Field
+from typing import Optional, Any, List, Dict
+from uuid import uuid4
+from pydantic import BaseModel, Field, ConfigDict
 
 class Entity(BaseModel):
-    name: str = Field(..., description="Canonical name of the entity")
-    labels: list[str] = Field(default_factory=lambda: ["Entity"])
-    summary: str = Field("", description="Summarized history of this entity")
-    attributes: dict[str, Any] = {}
+    uuid: str = Field(default_factory=lambda: str(uuid4()))
+    name: str
+    labels: List[str] = ["Entity"]
+    summary: str = ""
+    attributes: Dict[str, Any] = {}
+    name_embedding: Optional[List[float]] = None
+
+    model_config = ConfigDict(extra='allow')
 
 class Relationship(BaseModel):
-    source: str
-    target: str
+    uuid: str = Field(default_factory=lambda: str(uuid4()))
+    source_uuid: str
+    target_uuid: str
     relation_type: str
     fact: str
+    fact_embedding: Optional[List[float]] = None
     valid_at: datetime
     invalid_at: Optional[datetime] = None
-    episodes: list[str] = Field(default_factory=list, description="UUIDs of source episodes")
-
-class Episode(BaseModel):
-    uuid: str
-    session_id: str
-    content: str
-    created_at: datetime
-    valid_at: datetime
+    episodes: List[str] = []
+    attributes: Dict[str, Any] = {}
 ```
 
-## 3. Postgres Schema (Session History)
+## 3. Production Ingestion Pipeline
 
-```sql
-CREATE TABLE sessions (
-    session_id UUID PRIMARY KEY,
-    user_id UUID,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-);
+### Step 1: Extraction with Structured Output
+Use LLM "Structured Output" (OpenAI/Gemini) to ensure the model adheres to your Pydantic schema.
 
-CREATE TABLE episodes (
-    uuid UUID PRIMARY KEY,
-    session_id UUID REFERENCES sessions(session_id),
-    content TEXT NOT NULL,
-    source_type VARCHAR(50), -- 'message', 'json', 'text'
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    valid_at TIMESTAMP WITH TIME ZONE NOT NULL
-);
-```
+### Step 2: Entity Resolution (Deduplication)
+Always check if an entity exists before creating a new one. Use a hybrid of:
+1.  **Exact Name Match:** Fastest, cheapest.
+2.  **Vector Similarity:** Use FalkorDB's `vecf32` indices to find entities with similar names.
+3.  **LLM Resolve:** Only for high-uncertainty matches.
 
-## 4. FalkorDB Implementation (Graph Knowledge)
+### Step 3: Temporal Invalidation (The "Graphiti" Logic)
+When a new fact arrives, invalidate the old one. This ensures your agent always has the "current" truth while retaining history.
 
-### Core Schema
-FalkorDB uses Cypher. Your nodes and edges should include temporal properties.
-
-**Nodes:** `(e:Entity {uuid, name, summary, attributes, name_embedding})`
-**Edges:** `(source)-[r:RELATES_TO {uuid, fact, fact_embedding, valid_at, invalid_at, episodes}]->(target)`
-
-### Bi-Temporal Invalidation Logic
-When a new fact is ingested that contradicts an old one, the system MUST invalidate the old fact instead of deleting it.
-
-**The Invalidation Query:**
+**Cypher Invalidation Pattern:**
 ```cypher
-MATCH (s:Entity {name: $source_name})-[r:RELATES_TO {name: $relation_type}]->(t:Entity {name: $target_name})
-WHERE r.invalid_at IS NULL
-  AND r.valid_at < $new_fact_valid_at
-SET r.invalid_at = $new_fact_valid_at
+MATCH (s:Entity {uuid: $source_uuid})-[r:RELATES_TO {relation_type: $rel_type}]->(t:Entity {uuid: $target_uuid})
+WHERE r.invalid_at IS NULL AND r.valid_at < $new_valid_at
+SET r.invalid_at = $new_valid_at
 ```
 
-## 5. The Ingestion Flow (Core Functionality)
+## 4. Operational Best Practices
 
-1.  **Extract:** Feed the current episode and `n` previous episodes to an LLM using `Structured Output` with your `Relationship` Pydantic model.
-2.  **Deduplicate:**
-    *   For each extracted Entity, query FalkorDB: `MATCH (e:Entity) WHERE e.name_embedding <SIMILARITY> $embedding RETURN e`.
-    *   If a match exists, use its canonical name.
-3.  **Temporal Update:**
-    *   Run the Invalidation Query for the new relationship.
-    *   Create the new relationship in FalkorDB with `valid_at = episode.valid_at` and `invalid_at = NULL`.
-
-## 6. Hybrid Retrieval Flow
-
-When the agent needs context, don't just use RAG. Use a Graph-Augmented approach:
-
-1.  **Semantic Retrieval:** Query FalkorDB for edges where `fact_embedding` is similar to the user query AND `invalid_at` is `NULL`.
-2.  **Graph Neighborhood:** For the top 3-5 entities found, fetch their "Contextual Neighborhood" (1-hop neighbors).
-3.  **System Message Assembly:** Convert the retrieved facts into a human-readable summary for the LLM.
+### Concurrency & Rate Limiting
+External LLM APIs have rate limits. Use an `asyncio.Semaphore` to limit concurrent extraction tasks.
 
 ```python
-# Pseudo-code for context assembly
-context = "The following is your current knowledge about the session context:\n"
-for edge in retrieved_edges:
-    context += f"- {edge.fact} (became true on {edge.valid_at})\n"
+semaphore = asyncio.Semaphore(10) # Max 10 concurrent LLM calls
+
+async def extract_with_limit(episode):
+    async with semaphore:
+        return await llm_client.extract(episode)
 ```
 
-## 7. Performance Considerations (Minimalist)
+### Observability
+Integrate OpenTelemetry for tracing the ingestion pipeline. This allows you to see exactly where bottlenecks or failures occur.
 
-*   **Concurrency:** Use a semaphore limit (e.g., 10) for LLM extraction calls to avoid rate limits.
-*   **Indices:** Ensure FalkorDB has a vector index on `Entity.name_embedding` and `Relationship.fact_embedding`.
-*   **Batching:** If ingesting many messages at once (e.g., historical imports), batch the `CREATE` statements in a single Cypher transaction.
+*   **Logs:** Use structured logging (JSON) to track entity resolutions and invalidations.
+*   **Traces:** Wrap the `Extract -> Resolve -> Store` loop in a trace span.
+
+### Resilience (Retries)
+Use `tenacity` to handle transient network errors or LLM 429s.
+
+```python
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+async def safe_db_call(query, params):
+    return await falkor_driver.execute_query(query, params)
+```
+
+### Security
+*   **API Keys:** Use environment variables or a secret manager.
+*   **Graph Injection:** Use parameterized Cypher queries to prevent graph injection attacks (similar to SQL injection).
+
+## 5. Retrieval Strategy (RAG vs GraphRAG)
+
+In production, don't just return raw strings. Return a structured `KnowledgeContext` object.
+
+1.  **Semantic Search:** Retrieve edges with `invalid_at IS NULL` and high vector similarity.
+2.  **Neighborhood Walk:** Fetch properties and summaries for all unique nodes involved in the retrieved edges.
+3.  **Provenance:** Always include the `valid_at` and `episodes` list in the context so the agent can cite its sources.
